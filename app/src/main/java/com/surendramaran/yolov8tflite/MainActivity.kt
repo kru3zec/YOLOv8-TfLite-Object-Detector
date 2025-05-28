@@ -1,196 +1,154 @@
 package com.surendramaran.yolov8tflite
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.Matrix
+import android.annotation.SuppressLint
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.media.Image
 import android.os.Bundle
 import android.util.Log
-import androidx.activity.result.contract.ActivityResultContracts
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.AspectRatio
-import androidx.camera.core.Camera
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.core.app.ActivityCompat
+import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
-import com.surendramaran.yolov8tflite.Constants.MODEL_PATH
-import com.surendramaran.yolov8tflite.databinding.ActivityMainBinding
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity(), Detector.DetectorListener {
-    private lateinit var binding: ActivityMainBinding
-    private val isFrontCamera = false
 
-    private var preview: Preview? = null
-    private var imageAnalyzer: ImageAnalysis? = null
-    private var camera: Camera? = null
-    private var cameraProvider: ProcessCameraProvider? = null
-    private var detector: Detector? = null
-
+    private lateinit var detector: Detector
+    private lateinit var overlayView: OverlayView
+    private lateinit var signLabel: TextView
+    private lateinit var previewView: PreviewView
+    private lateinit var returnButton: Button
+    private lateinit var signName: TextView
+    private lateinit var signDescription: TextView
+    private lateinit var signBoxes: TextView
+    private lateinit var signImage: ImageView
     private lateinit var cameraExecutor: ExecutorService
 
+    @SuppressLint("MissingInflatedId")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        setContentView(R.layout.fragment_camera)
+
+        overlayView = findViewById(R.id.overlayView)
+        signLabel = findViewById(R.id.detectedSignText)
+        previewView = findViewById(R.id.camera_preview)
+        returnButton = findViewById(R.id.returnButton)
+        signName = findViewById(R.id.signName)
+        signDescription = findViewById(R.id.signDescription)
+        signBoxes = findViewById(R.id.signBoxes)
+        signImage = findViewById(R.id.signImage)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        cameraExecutor.execute {
-            detector = Detector(baseContext, MODEL_PATH, LABELS_PATH, this)
-        }
+        detector = Detector(this, this)
 
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        }
+        startCamera()
 
-        bindListeners()
-    }
-
-    private fun bindListeners() {
-        binding.apply {
-            isGpu.setOnCheckedChangeListener { buttonView, isChecked ->
-                cameraExecutor.submit {
-                    detector?.restart(isGpu = isChecked)
-                }
-                if (isChecked) {
-                    buttonView.setBackgroundColor(ContextCompat.getColor(baseContext, R.color.orange))
-                } else {
-                    buttonView.setBackgroundColor(ContextCompat.getColor(baseContext, R.color.gray))
-                }
-            }
+        returnButton.setOnClickListener {
+            finish()
         }
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
         cameraProviderFuture.addListener({
-            cameraProvider  = cameraProviderFuture.get()
-            bindCameraUseCases()
+            val cameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor) { imageProxy ->
+                        val bitmap = imageProxyToBitmap(imageProxy)
+                        detector.detect(bitmap)
+                        imageProxy.close()
+                    }
+                }
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageAnalysis
+                )
+            } catch (exc: Exception) {
+                Log.e("Camera", "Binding failed", exc)
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun bindCameraUseCases() {
-        val cameraProvider = cameraProvider ?: throw IllegalStateException("Camera initialization failed.")
+    @OptIn(ExperimentalGetImage::class)
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): android.graphics.Bitmap {
+        val image: Image = imageProxy.image ?: return BitmapFactory.decodeResource(resources, android.R.drawable.ic_delete)
 
-        val rotation = binding.viewFinder.display.rotation
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
 
-        val cameraSelector = CameraSelector
-            .Builder()
-            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-            .build()
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
 
-        preview =  Preview.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .setTargetRotation(rotation)
-            .build()
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
 
-        imageAnalyzer = ImageAnalysis.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setTargetRotation(binding.viewFinder.display.rotation)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-
-        imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
-            val bitmapBuffer =
-                Bitmap.createBitmap(
-                    imageProxy.width,
-                    imageProxy.height,
-                    Bitmap.Config.ARGB_8888
-                )
-            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-            imageProxy.close()
-
-            val matrix = Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-
-                if (isFrontCamera) {
-                    postScale(
-                        -1f,
-                        1f,
-                        imageProxy.width.toFloat(),
-                        imageProxy.height.toFloat()
-                    )
-                }
-            }
-
-            val rotatedBitmap = Bitmap.createBitmap(
-                bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
-                matrix, true
-            )
-
-            detector?.detect(rotatedBitmap)
-        }
-
-        cameraProvider.unbindAll()
-
-        try {
-            camera = cameraProvider.bindToLifecycle(
-                this,
-                cameraSelector,
-                preview,
-                imageAnalyzer
-            )
-
-            preview?.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-        } catch(exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
-        }
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it[Manifest.permission.CAMERA] == true) { startCamera() }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        detector?.close()
-        cameraExecutor.shutdown()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (allPermissionsGranted()){
-            startCamera()
-        } else {
-            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-        }
-    }
-
-    companion object {
-        private const val TAG = "Camera"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = mutableListOf (
-            Manifest.permission.CAMERA
-        ).toTypedArray()
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
+        val yuv = out.toByteArray()
+        return BitmapFactory.decodeByteArray(yuv, 0, yuv.size)
     }
 
     override fun onEmptyDetect() {
         runOnUiThread {
-            binding.overlay.clear()
+            overlayView.setResults(emptyList())
+            overlayView.invalidate()
+            signLabel.text = "Brak wykrycia"
+            signName.text = ""
+            signDescription.text = ""
+            signBoxes.text = ""
+            signImage.visibility = ImageView.GONE
         }
     }
 
-    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
+    override fun onDetect(boundingBoxes: List<Box>, inferenceTime: Long) {
         runOnUiThread {
-            binding.inferenceTime.text = "${inferenceTime}ms"
-            binding.overlay.apply {
-                setResults(boundingBoxes)
-                invalidate()
+            overlayView.setResults(boundingBoxes)
+            overlayView.invalidate()
+
+            val topBox = boundingBoxes.maxByOrNull { it.confidence }
+            signLabel.text = topBox?.class_id ?: "Brak etykiety"
+
+            topBox?.let { box ->
+                signName.text = box.class_id
+                signDescription.text = "Wykryto z pewnością ${(box.confidence * 100).toInt()}%"
+                signBoxes.text = "(%d, %d, %d, %d)".format(box.x1, box.y1, box.x2, box.y2)
+                signImage.visibility = ImageView.VISIBLE
+                // Możesz tu dodać dynamiczne przypisywanie grafiki do signImage jeśli masz zasoby
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
     }
 }

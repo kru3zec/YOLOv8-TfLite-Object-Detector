@@ -3,6 +3,8 @@ package com.surendramaran.yolov8tflite
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
+import android.util.Log
+import com.surendramaran.yolov8tflite.Box
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -12,231 +14,150 @@ import org.tensorflow.lite.support.common.ops.CastOp
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
-import java.io.BufferedReader
-import java.io.IOException
-import java.io.InputStream
-import java.io.InputStreamReader
+import kotlin.math.exp
+import kotlin.math.roundToInt
 
 class Detector(
     private val context: Context,
-    private val modelPath: String,
-    private val labelPath: String,
-    private val detectorListener: DetectorListener,
+    private val detectorListener: DetectorListener
 ) {
 
+    private val modelPath = "best_float32.tflite"
+    private val labelPath = "labels.txt"
+
     private var interpreter: Interpreter
-    private var labels = mutableListOf<String>()
-
-    private var tensorWidth = 0
-    private var tensorHeight = 0
-    private var numChannel = 0
-    private var numElements = 0
-
+    private var labels = listOf<String>()
     private val imageProcessor = ImageProcessor.Builder()
-        .add(NormalizeOp(INPUT_MEAN, INPUT_STANDARD_DEVIATION))
-        .add(CastOp(INPUT_IMAGE_TYPE))
+        .add(NormalizeOp(0f, 255f))
+        .add(CastOp(DataType.FLOAT32))
         .build()
 
     init {
-        val compatList = CompatibilityList()
-
-        val options = Interpreter.Options().apply{
-            if(compatList.isDelegateSupportedOnThisDevice){
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                this.addDelegate(GpuDelegate(delegateOptions))
-            } else {
-                this.setNumThreads(4)
-            }
-        }
-
-        val model = FileUtil.loadMappedFile(context, modelPath)
-        interpreter = Interpreter(model, options)
-
-        val inputShape = interpreter.getInputTensor(0)?.shape()
-        val outputShape = interpreter.getOutputTensor(0)?.shape()
-
-        if (inputShape != null) {
-            tensorWidth = inputShape[1]
-            tensorHeight = inputShape[2]
-
-            // If in case input shape is in format of [1, 3, ..., ...]
-            if (inputShape[1] == 3) {
-                tensorWidth = inputShape[2]
-                tensorHeight = inputShape[3]
-            }
-        }
-
-        if (outputShape != null) {
-            numChannel = outputShape[1]
-            numElements = outputShape[2]
-        }
-
-        try {
-            val inputStream: InputStream = context.assets.open(labelPath)
-            val reader = BufferedReader(InputStreamReader(inputStream))
-
-            var line: String? = reader.readLine()
-            while (line != null && line != "") {
-                labels.add(line)
-                line = reader.readLine()
-            }
-
-            reader.close()
-            inputStream.close()
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-    }
-
-    fun restart(isGpu: Boolean) {
-        interpreter.close()
-
-        val options = if (isGpu) {
+        val options = Interpreter.Options().apply {
             val compatList = CompatibilityList()
-            Interpreter.Options().apply{
-                if(compatList.isDelegateSupportedOnThisDevice){
-                    val delegateOptions = compatList.bestOptionsForThisDevice
-                    this.addDelegate(GpuDelegate(delegateOptions))
-                } else {
-                    this.setNumThreads(4)
-                }
-            }
-        } else {
-            Interpreter.Options().apply{
-                this.setNumThreads(4)
+            if (compatList.isDelegateSupportedOnThisDevice) {
+                addDelegate(GpuDelegate(compatList.bestOptionsForThisDevice))
+            } else {
+                setNumThreads(4)
             }
         }
 
-        val model = FileUtil.loadMappedFile(context, modelPath)
-        interpreter = Interpreter(model, options)
-    }
-
-    fun close() {
-        interpreter.close()
+        interpreter = Interpreter(FileUtil.loadMappedFile(context, modelPath), options)
+        labels = FileUtil.loadLabels(context, labelPath)
+        Log.d(TAG, "Loaded labels: ${labels.size}")
     }
 
     fun detect(frame: Bitmap) {
-        if (tensorWidth == 0) return
-        if (tensorHeight == 0) return
-        if (numChannel == 0) return
-        if (numElements == 0) return
+        val resized = Bitmap.createScaledBitmap(frame, 640, 640, true)
+        val tensorImage = TensorImage(DataType.FLOAT32)
+        tensorImage.load(resized)
+        val inputBuffer = imageProcessor.process(tensorImage).buffer
 
-        var inferenceTime = SystemClock.uptimeMillis()
+        val outputRaw = Array(1) { Array(104) { FloatArray(8400) } }
 
-        val resizedBitmap = Bitmap.createScaledBitmap(frame, tensorWidth, tensorHeight, false)
+        val startTime = SystemClock.uptimeMillis()
+        interpreter.run(inputBuffer, outputRaw)
+        val inferenceTime = SystemClock.uptimeMillis() - startTime
 
-        val tensorImage = TensorImage(INPUT_IMAGE_TYPE)
-        tensorImage.load(resizedBitmap)
-        val processedImage = imageProcessor.process(tensorImage)
-        val imageBuffer = processedImage.buffer
-
-        val output = TensorBuffer.createFixedSize(intArrayOf(1, numChannel, numElements), OUTPUT_IMAGE_TYPE)
-        interpreter.run(imageBuffer, output.buffer)
-
-        val bestBoxes = bestBox(output.floatArray)
-        inferenceTime = SystemClock.uptimeMillis() - inferenceTime
-
-        if (bestBoxes == null) {
+        val boxes = parseDetections(outputRaw[0])
+        if (boxes.isEmpty()) {
             detectorListener.onEmptyDetect()
-            return
+        } else {
+            detectorListener.onDetect(boxes, inferenceTime)
         }
-
-        detectorListener.onDetect(bestBoxes, inferenceTime)
     }
 
-    private fun bestBox(array: FloatArray) : List<BoundingBox>? {
+    private fun sigmoid(x: Float): Float = (1f / (1f + exp(-x)))
 
-        val boundingBoxes = mutableListOf<BoundingBox>()
+    private fun parseDetections(data: Array<FloatArray>): List<Box> {
+        val boxes = mutableListOf<Box>()
 
-        for (c in 0 until numElements) {
-            var maxConf = CONFIDENCE_THRESHOLD
-            var maxIdx = -1
-            var j = 4
-            var arrayIdx = c + numElements * j
-            while (j < numChannel){
-                if (array[arrayIdx] > maxConf) {
-                    maxConf = array[arrayIdx]
-                    maxIdx = j - 4
-                }
-                j++
-                arrayIdx += numElements
-            }
+        for (i in data.indices) {
+            val row = data[i]
+            if (row.size < 6) continue
 
-            if (maxConf > CONFIDENCE_THRESHOLD) {
-                val clsName = labels[maxIdx]
-                val cx = array[c] // 0
-                val cy = array[c + numElements] // 1
-                val w = array[c + numElements * 2]
-                val h = array[c + numElements * 3]
-                val x1 = cx - (w/2F)
-                val y1 = cy - (h/2F)
-                val x2 = cx + (w/2F)
-                val y2 = cy + (h/2F)
-                if (x1 < 0F || x1 > 1F) continue
-                if (y1 < 0F || y1 > 1F) continue
-                if (x2 < 0F || x2 > 1F) continue
-                if (y2 < 0F || y2 > 1F) continue
+            val cx = row[0]
+            val cy = row[1]
+            val w = row[2]
+            val h = row[3]
+            val confidence = sigmoid(row[4])
+            if (confidence < CONFIDENCE_THRESHOLD) continue
 
-                boundingBoxes.add(
-                    BoundingBox(
-                        x1 = x1, y1 = y1, x2 = x2, y2 = y2,
-                        cx = cx, cy = cy, w = w, h = h,
-                        cnf = maxConf, cls = maxIdx, clsName = clsName
-                    )
+            val classScores = row.copyOfRange(5, row.size).map { sigmoid(it) }
+            val maxIdx = classScores.indices.maxByOrNull { classScores[it] } ?: continue
+            val score = classScores[maxIdx] * confidence
+            if (score < CONFIDENCE_THRESHOLD) continue
+
+            val scaledCx = cx / 640f
+            val scaledCy = cy / 640f
+            val scaledW = w / 640f
+            val scaledH = h / 640f
+
+            val x1 = ((scaledCx - scaledW / 2f) * 640).roundToInt()
+            val y1 = ((scaledCy - scaledH / 2f) * 640).roundToInt()
+            val x2 = ((scaledCx + scaledW / 2f) * 640).roundToInt()
+            val y2 = ((scaledCy + scaledH / 2f) * 640).roundToInt()
+
+            if (x1 < 0 || y1 < 0 || x2 > 640 || y2 > 640) continue
+            if (maxIdx >= labels.size) continue
+
+            boxes.add(
+                Box(
+                    x1 = x1,
+                    y1 = y1,
+                    x2 = x2,
+                    y2 = y2,
+                    class_id = labels[maxIdx],
+                    confidence = score,
+                    timeDetected = null
                 )
-            }
+            )
+
+            Log.d(TAG, "Detected: ${labels[maxIdx]} (${String.format("%.2f", score * 100)}%)")
         }
 
-        if (boundingBoxes.isEmpty()) return null
-
-        return applyNMS(boundingBoxes)
+        Log.d(TAG, "Total valid detections: ${boxes.size}")
+        return applyNMS(boxes).take(10)
     }
 
-    private fun applyNMS(boxes: List<BoundingBox>) : MutableList<BoundingBox> {
-        val sortedBoxes = boxes.sortedByDescending { it.cnf }.toMutableList()
-        val selectedBoxes = mutableListOf<BoundingBox>()
+    private fun applyNMS(boxes: List<Box>): List<Box> {
+        val selected = mutableListOf<Box>()
+        val sorted = boxes.sortedByDescending { it.confidence }.toMutableList()
 
-        while(sortedBoxes.isNotEmpty()) {
-            val first = sortedBoxes.first()
-            selectedBoxes.add(first)
-            sortedBoxes.remove(first)
+        while (sorted.isNotEmpty()) {
+            val chosen = sorted.removeAt(0)
+            selected.add(chosen)
 
-            val iterator = sortedBoxes.iterator()
-            while (iterator.hasNext()) {
-                val nextBox = iterator.next()
-                val iou = calculateIoU(first, nextBox)
-                if (iou >= IOU_THRESHOLD) {
-                    iterator.remove()
-                }
+            val iter = sorted.iterator()
+            while (iter.hasNext()) {
+                val next = iter.next()
+                val iou = calculateIoU(chosen, next)
+                if (iou > IOU_THRESHOLD) iter.remove()
             }
         }
-
-        return selectedBoxes
+        return selected
     }
 
-    private fun calculateIoU(box1: BoundingBox, box2: BoundingBox): Float {
-        val x1 = maxOf(box1.x1, box2.x1)
-        val y1 = maxOf(box1.y1, box2.y1)
-        val x2 = minOf(box1.x2, box2.x2)
-        val y2 = minOf(box1.y2, box2.y2)
-        val intersectionArea = maxOf(0F, x2 - x1) * maxOf(0F, y2 - y1)
-        val box1Area = box1.w * box1.h
-        val box2Area = box2.w * box2.h
-        return intersectionArea / (box1Area + box2Area - intersectionArea)
+    private fun calculateIoU(a: Box, b: Box): Float {
+        val x1 = maxOf(a.x1, b.x1)
+        val y1 = maxOf(a.y1, b.y1)
+        val x2 = minOf(a.x2, b.x2)
+        val y2 = minOf(a.y2, b.y2)
+        val inter = maxOf(0, x2 - x1) * maxOf(0, y2 - y1)
+        val areaA = (a.x2 - a.x1) * (a.y2 - a.y1)
+        val areaB = (b.x2 - b.x1) * (b.y2 - b.y1)
+        val union = areaA + areaB - inter
+        return if (union <= 0f) 0f else inter.toFloat() / union.toFloat()
     }
 
     interface DetectorListener {
         fun onEmptyDetect()
-        fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long)
+        fun onDetect(boundingBoxes: List<Box>, inferenceTime: Long)
     }
 
     companion object {
-        private const val INPUT_MEAN = 0f
-        private const val INPUT_STANDARD_DEVIATION = 255f
-        private val INPUT_IMAGE_TYPE = DataType.FLOAT32
-        private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
-        private const val CONFIDENCE_THRESHOLD = 0.3F
-        private const val IOU_THRESHOLD = 0.5F
+        private const val TAG = "Detector"
+        private const val CONFIDENCE_THRESHOLD = 0.35f
+        private const val IOU_THRESHOLD = 0.45f
     }
 }

@@ -5,16 +5,13 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
-import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
 import androidx.core.content.ContextCompat
-import java.util.LinkedList
-import kotlin.math.max
 
 class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs) {
 
-    private var results = listOf<BoundingBox>()
+    private var results = listOf<Box>()
     private var boxPaint = Paint()
     private var textBackgroundPaint = Paint()
     private var textPaint = Paint()
@@ -52,13 +49,15 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
         super.draw(canvas)
 
         results.forEach {
-            val left = it.x1 * width
-            val top = it.y1 * height
-            val right = it.x2 * width
-            val bottom = it.y2 * height
+            val left = it.x1.toFloat() / 640 * width
+            val top = it.y1.toFloat() / 640 * height
+            val right = it.x2.toFloat() / 640 * width
+            val bottom = it.y2.toFloat() / 640 * height
 
             canvas.drawRect(left, top, right, bottom, boxPaint)
-            val drawableText = it.clsName
+
+            val confidencePercent = String.format("%.2f", it.confidence * 100)
+            val drawableText = "${it.class_id} (${confidencePercent}%)"
 
             textBackgroundPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
             val textWidth = bounds.width()
@@ -71,11 +70,10 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
                 textBackgroundPaint
             )
             canvas.drawText(drawableText, left, top + bounds.height(), textPaint)
-
         }
     }
 
-    fun setResults(boundingBoxes: List<BoundingBox>) {
+    fun setResults(boundingBoxes: List<Box>) {
         results = boundingBoxes
         invalidate()
     }
